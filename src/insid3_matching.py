@@ -33,8 +33,27 @@ def _normalize_rows(values: np.ndarray) -> np.ndarray:
     length = np.linalg.norm(scaled, axis=-1, keepdims=True)
     # A nonzero scaled row has length >= 1. An all-zero row stays zero.
     unit = scaled / np.maximum(length, 1.0)
-    attenuation = np.minimum(np.minimum(scale, _EPS) * length / _EPS, 1.0)
+    attenuation = np.minimum((np.minimum(scale, _EPS) / _EPS) * length, 1.0)
     return unit * attenuation
+
+
+def _remove_roundoff(
+    values: np.ndarray, input_scale: np.ndarray, row_scale: np.ndarray | float
+) -> np.ndarray:
+    """Zero a row only when all components are at their local rounding scale.
+
+    Local contraction scales cover arithmetic cancellation; a small floor
+    covers roundoff from estimating the basis and earlier normalization.
+    Neither grows just because empty channels are appended. This float64
+    tolerance is separate from EPS-clamped normalization.
+    """
+    relative_tolerance = 8 * np.finfo(np.float64).eps
+    is_roundoff = np.all(
+        np.abs(values) <= relative_tolerance * input_scale + 4 * relative_tolerance * row_scale,
+        axis=-1,
+        keepdims=True,
+    )
+    return np.where(is_roundoff, 0.0, values)
 
 
 def compute_debiased_similarity(
@@ -66,7 +85,11 @@ def compute_debiased_similarity(
     Reference and target patches are normalized, projected, and normalized
     again; only then is the foreground mean formed and normalized. Rank zero
     bypasses SVD/projection. Zero singular directions are retained in the
-    requested SVD slice, as in the author code. No input is modified.
+    requested SVD slice, as in the author code. Full-channel projection is
+    exactly zero. Projection and foreground-mean cancellation residuals at
+    float64 rounding scale are zeroed before normalization. This numerical
+    guard is an explicit extension of the author implementation. No input is
+    modified.
     """
     if isinstance(rank, (bool, np.bool_)) or not isinstance(rank, (int, np.integer)):
         raise TypeError("rank must be a nonnegative integer, not a boolean")
@@ -98,17 +121,34 @@ def compute_debiased_similarity(
         basis = right_vectors[:effective_rank].T.copy()
     else:
         basis = np.empty((channels, 0), dtype=np.float64)
+    absolute_basis = np.abs(basis)
 
     def project(grid: np.ndarray) -> np.ndarray:
         normalized = _normalize_rows(grid.reshape(-1, channels))
         if effective_rank == 0:
             return normalized
+        if effective_rank == channels:
+            return np.zeros_like(normalized)
         residual = normalized - (normalized @ basis) @ basis.T
+        # Absolute contraction magnitudes account for cancellation inside
+        # both products without spreading one channel's scale to every other.
+        scale = np.abs(normalized) + (
+            np.abs(normalized) @ absolute_basis
+        ) @ absolute_basis.T
+        residual = _remove_roundoff(
+            residual, scale, np.max(np.abs(normalized), axis=-1, keepdims=True)
+        )
         return _normalize_rows(residual)
 
     reference_debiased = project(reference)
     target_debiased = project(target)
-    prototype = _normalize_rows(reference_debiased[foreground].mean(axis=0))
+    foreground_features = reference_debiased[foreground]
+    foreground_mean = foreground_features.mean(axis=0)
+    mean_scale = np.abs(foreground_features).mean(axis=0)
+    mean_row_scale = np.max(np.abs(foreground_features), axis=-1).mean()
+    prototype = _normalize_rows(
+        _remove_roundoff(foreground_mean, mean_scale, mean_row_scale)
+    )
     similarity = (target_debiased @ prototype).reshape(target.shape[:2])
     return {
         "basis": basis,

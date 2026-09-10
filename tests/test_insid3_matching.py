@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from numpy.testing import assert_allclose, assert_array_equal
 
-from src.insid3_matching import compute_debiased_similarity
+from src.insid3_matching import _normalize_rows, compute_debiased_similarity
 
 
 def sample_inputs():
@@ -269,3 +269,204 @@ def test_noninteger_or_boolean_rank_is_rejected(rank):
 def test_invalid_inputs_fail_explicitly(field, value, error):
     with pytest.raises(ValueError, match=error):
         compute_debiased_similarity(**{**sample_inputs(), field: value})
+
+
+def test_rotated_pure_position_cannot_create_a_semantic_reference():
+    rotation, _ = np.linalg.qr(np.random.default_rng(5).normal(size=(3, 3)))
+    position, semantic, other = rotation.T
+    result = compute_debiased_similarity(
+        np.array([position, -position]).reshape(1, 2, 3),
+        position.reshape(1, 1, 3),
+        np.ones((1, 1)),
+        np.array([semantic, other, -semantic]).reshape(1, 3, 3),
+        1,
+    )
+    # Normalizing roundoff twice used to create scores as large as 0.89.
+    assert_array_equal(result["reference_prototype"], np.zeros(3))
+    assert_array_equal(result["similarity_map"], np.zeros((1, 3)))
+
+
+def test_random_full_channel_projection_has_no_remaining_features():
+    rng = np.random.default_rng(19)
+    result = compute_debiased_similarity(
+        rng.normal(size=(2, 4, 5)),
+        rng.normal(size=(2, 3, 5)),
+        np.ones((2, 3)),
+        rng.normal(size=(3, 2, 5)),
+        5,
+    )
+    assert_allclose(result["basis"] @ result["basis"].T, np.eye(5), atol=1e-12)
+    assert_array_equal(result["reference_prototype"], np.zeros(5))
+    assert_array_equal(result["similarity_map"], np.zeros((3, 2)))
+
+
+def test_rotated_semantics_cancel_despite_different_position_components():
+    rotation, _ = np.linalg.qr(np.random.default_rng(1).normal(size=(3, 3)))
+    position, other_position, semantic = rotation.T
+    result = compute_debiased_similarity(
+        np.array([position, -position, other_position, -other_position]).reshape(2, 2, 3),
+        np.array([position + semantic, 2 * position - semantic]).reshape(1, 2, 3),
+        np.ones((1, 2)),
+        np.array([semantic, -semantic]).reshape(1, 2, 3),
+        2,
+    )
+    # After projection and patch normalization, the foreground is [s, -s].
+    assert_array_equal(result["reference_prototype"], np.zeros(3))
+    assert_array_equal(result["similarity_map"], np.zeros((1, 2)))
+
+
+@pytest.mark.parametrize("semantic_strength,expected_score", [(1e-10, 1.0), (1e-13, 0.1)])
+def test_real_weak_projected_semantics_survive_roundoff_cleanup(semantic_strength, expected_score):
+    result = compute_debiased_similarity(
+        np.array([[[1.0, 0, 0], [-1.0, 0, 0]]]),
+        np.array([[[0, 1.0, 0]]]),
+        np.ones((1, 1)),
+        np.array([[[1.0, semantic_strength, 0], [1.0, -semantic_strength, 0]]]),
+        1,
+    )
+    # A residual below normalization EPS is attenuated, not discarded.
+    assert_allclose(result["reference_prototype"], [0, 1, 0], atol=1e-15)
+    assert_allclose(result["similarity_map"], [[expected_score, -expected_score]], atol=1e-15)
+
+
+def test_real_weak_foreground_imbalance_is_not_mistaken_for_exact_cancellation():
+    result = compute_debiased_similarity(
+        np.array([[[1.0, 0, 0], [-1.0, 0, 0]]]),
+        np.array([[[0, 1.0, 0], [0, -1.0, 1e-13]]]),
+        np.ones((1, 2)),
+        np.array([[[0, 0, 1.0], [0, 0, -1.0]]]),
+        1,
+    )
+    # The true mean is 5e-14 e3; epsilon normalization produces 0.05 e3.
+    assert_allclose(result["reference_prototype"], [0, 0, 0.05], atol=1e-15)
+    assert_allclose(result["similarity_map"], [[0.05, -0.05]], atol=1e-15)
+
+
+def test_subnormal_row_normalization_preserves_x_over_epsilon():
+    tiny = np.nextafter(0.0, 1.0)
+    values = np.array([[tiny, tiny], [2 * tiny, -tiny]])
+    # Avoid computing a subnormal norm first: all rows are far below EPS.
+    assert_allclose(_normalize_rows(values), values / 1e-12, rtol=1e-12, atol=0)
+
+
+def nondegenerate_inputs():
+    rng = np.random.default_rng(246)
+    return {
+        "probe_features": rng.normal(size=(2, 5, 5)) * np.array([4, 2, 1, 0.5, 0.25]),
+        "reference_features": rng.normal(size=(2, 3, 5)),
+        "reference_mask": np.array([[1, 0, 1], [0, 1, 0]]),
+        "target_features": rng.normal(size=(3, 2, 5)),
+        "rank": 2,
+    }
+
+
+def test_matches_independent_channels_first_author_matrix_form():
+    inputs = nondegenerate_inputs()
+    channels = inputs["probe_features"].shape[-1]
+
+    def normalize_columns(matrix):
+        return matrix / np.maximum(np.linalg.norm(matrix, axis=0, keepdims=True), 1e-12)
+
+    # Independently use the author's (C, P) layout, left singular vectors,
+    # and explicit orthogonal-complement matrix, rather than the implementation's helper.
+    probe = normalize_columns(inputs["probe_features"].reshape(-1, channels).T)
+    centered = probe - probe.mean(axis=1, keepdims=True)
+    left, singular_values, _ = np.linalg.svd(centered, full_matrices=False)
+    assert np.all(singular_values[:-1] - singular_values[1:] > 1e-3)
+    basis = left[:, :inputs["rank"]]
+    complement = np.eye(channels) - basis @ basis.T
+    reference = normalize_columns(inputs["reference_features"].reshape(-1, channels).T)
+    target = normalize_columns(inputs["target_features"].reshape(-1, channels).T)
+    reference = normalize_columns(complement @ reference)
+    target = normalize_columns(complement @ target)
+    foreground = inputs["reference_mask"].ravel().astype(bool)
+    prototype = normalize_columns(reference[:, foreground].mean(axis=1, keepdims=True)).ravel()
+    expected_similarity = (prototype @ target).reshape(inputs["target_features"].shape[:2])
+
+    result = compute_debiased_similarity(**inputs)
+    assert_allclose(result["basis"] @ result["basis"].T, basis @ basis.T, atol=1e-12)
+    assert_allclose(result["reference_prototype"], prototype, atol=1e-12)
+    assert_allclose(result["similarity_map"], expected_similarity, atol=1e-12)
+
+
+def test_matching_is_invariant_to_orthogonal_channel_rotation():
+    inputs = nondegenerate_inputs()
+    rotation, _ = np.linalg.qr(np.random.default_rng(71).normal(size=(5, 5)))
+    rotated_inputs = dict(inputs)
+    for name in ("probe_features", "reference_features", "target_features"):
+        rotated_inputs[name] = inputs[name] @ rotation
+    original = compute_debiased_similarity(**inputs)
+    rotated = compute_debiased_similarity(**rotated_inputs)
+    original_projector = original["basis"] @ original["basis"].T
+    assert_allclose(
+        rotated["basis"] @ rotated["basis"].T,
+        rotation.T @ original_projector @ rotation,
+        atol=1e-12,
+    )
+    assert_allclose(rotated["reference_prototype"], original["reference_prototype"] @ rotation, atol=1e-12)
+    assert_allclose(rotated["similarity_map"], original["similarity_map"], atol=1e-12)
+
+
+@pytest.mark.parametrize("channels", [3, 768])
+def test_zero_channel_padding_preserves_a_real_weak_projected_signal(channels):
+    position = np.eye(1, channels, 0).ravel()
+    semantic = np.eye(1, channels, 1).ravel()
+    result = compute_debiased_similarity(
+        np.array([position, -position]).reshape(1, 2, channels),
+        semantic.reshape(1, 1, channels),
+        np.ones((1, 1)),
+        (position + 1e-12 * semantic).reshape(1, 1, channels),
+        1,
+    )
+    # Appending inactive channels cannot turn a resolvable residual into zero.
+    assert_allclose(result["reference_prototype"], semantic, atol=1e-15)
+    assert_allclose(result["similarity_map"], [[1.0]], atol=1e-15)
+
+
+@pytest.mark.parametrize("channels", [3, 768])
+def test_zero_channel_padding_preserves_a_real_weak_foreground_mean(channels):
+    dominant = np.eye(1, channels, 0).ravel()
+    semantic = np.eye(1, channels, 1).ravel()
+    result = compute_debiased_similarity(
+        np.zeros((1, 1, channels)),
+        np.array([dominant, -dominant + 1e-12 * semantic]).reshape(1, 2, channels),
+        np.ones((1, 2)),
+        semantic.reshape(1, 1, channels),
+        0,
+    )
+    # The e1 terms cancel, leaving a mean of 5e-13 e2, then EPS attenuation.
+    assert_allclose(result["reference_prototype"], 0.5 * semantic, atol=1e-15)
+    assert_allclose(result["similarity_map"], [[0.5]], atol=1e-15)
+
+
+def test_weak_semantics_spread_across_many_channels_remain_resolvable():
+    channels = 768
+    position = np.ones(channels) / np.sqrt(channels)
+    semantic = np.ones(channels) / np.sqrt(channels)
+    semantic[channels // 2:] *= -1
+    result = compute_debiased_similarity(
+        np.array([position, -position]).reshape(1, 2, channels),
+        semantic.reshape(1, 1, channels),
+        np.ones((1, 1)),
+        (position + 1e-12 * semantic).reshape(1, 1, channels),
+        1,
+    )
+    # The input addition loses a few relative digits, so allow its rounding error.
+    assert_allclose(result["similarity_map"], [[1.0]], rtol=0, atol=1e-3)
+
+
+def test_svd_subspace_estimation_roundoff_cannot_create_a_semantic_reference():
+    rng = np.random.default_rng(1)
+    positional_basis, _ = np.linalg.qr(rng.normal(size=(32, 3)))
+    pure_position = positional_basis @ rng.normal(size=3)
+    result = compute_debiased_similarity(
+        np.vstack([positional_basis.T, -positional_basis.T]).reshape(2, 3, 32),
+        pure_position.reshape(1, 1, 32),
+        np.ones((1, 1)),
+        rng.normal(size=(2, 3, 32)),
+        3,
+    )
+    # The learned span equals the input span; SVD rounding in small individual
+    # coordinates must not turn a fully positional reference into a unit vector.
+    assert_array_equal(result["reference_prototype"], np.zeros(32))
+    assert_array_equal(result["similarity_map"], np.zeros((2, 3)))
