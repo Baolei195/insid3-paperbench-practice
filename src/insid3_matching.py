@@ -6,6 +6,8 @@ The ordering follows INSID3, Section 3.1, and the author implementation at
 
 from __future__ import annotations
 
+from math import fsum
+
 import numpy as np
 
 
@@ -37,23 +39,27 @@ def _normalize_rows(values: np.ndarray) -> np.ndarray:
     return unit * attenuation
 
 
-def _remove_roundoff(
-    values: np.ndarray, input_scale: np.ndarray, row_scale: np.ndarray | float
-) -> np.ndarray:
-    """Zero a row only when all components are at their local rounding scale.
+def _stable_mean(values: np.ndarray) -> np.ndarray:
+    """Mean of bounded patch rows using accurate, per-channel summation.
 
-    Local contraction scales cover arithmetic cancellation; a small floor
-    covers roundoff from estimating the basis and earlier normalization.
-    Neither grows just because empty channels are appended. This float64
-    tolerance is separate from EPS-clamped normalization.
+    Inputs here are normalized features or bounded error estimates, so
+    fsum cannot overflow for any array that fits in memory.
+    Unlike a strided reduction, its cancellation error does not accumulate
+    with the order in which foreground patches happen to occur.
     """
-    relative_tolerance = 8 * np.finfo(np.float64).eps
-    is_roundoff = np.all(
-        np.abs(values) <= relative_tolerance * input_scale + 4 * relative_tolerance * row_scale,
-        axis=-1,
-        keepdims=True,
-    )
-    return np.where(is_roundoff, 0.0, values)
+    return np.array([fsum(column) for column in values.T]) / values.shape[0]
+
+
+def _row_norm(values: np.ndarray) -> np.ndarray:
+    """L2 norms of bounded rows without squaring tiny inputs to zero."""
+    scale = np.max(np.abs(values), axis=-1, keepdims=True)
+    scaled = values / np.where(scale > 0, scale, 1.0)
+    return scale * np.linalg.norm(scaled, axis=-1, keepdims=True)
+
+
+def _roundoff_scale(values: np.ndarray) -> np.ndarray:
+    """Small normwise float64 error estimate for bounded feature rows."""
+    return 8 * np.finfo(np.float64).eps * _row_norm(values)
 
 
 def compute_debiased_similarity(
@@ -87,9 +93,10 @@ def compute_debiased_similarity(
     bypasses SVD/projection. Zero singular directions are retained in the
     requested SVD slice, as in the author code. Full-channel projection is
     exactly zero. Projection and foreground-mean cancellation residuals at
-    float64 rounding scale are zeroed before normalization. This numerical
-    guard is an explicit extension of the author implementation. No input is
-    modified.
+    float64 rounding scale are zeroed before normalization. Normwise error
+    estimates propagate through patch normalization; means use accurate
+    summation. These guards are engineering extensions, not universal SVD
+    error bounds. No input is modified.
     """
     if isinstance(rank, (bool, np.bool_)) or not isinstance(rank, (int, np.integer)):
         raise TypeError("rank must be a nonnegative integer, not a boolean")
@@ -116,39 +123,53 @@ def compute_debiased_similarity(
     effective_rank = min(int(rank), patch_count, channels)
     if effective_rank:
         normalized_probe = _normalize_rows(probe.reshape(-1, channels))
-        centered_probe = normalized_probe - normalized_probe.mean(axis=0, keepdims=True)
+        centered_probe = normalized_probe - _stable_mean(normalized_probe)
         _, _, right_vectors = np.linalg.svd(centered_probe, full_matrices=False)
         basis = right_vectors[:effective_rank].T.copy()
     else:
         basis = np.empty((channels, 0), dtype=np.float64)
     absolute_basis = np.abs(basis)
 
-    def project(grid: np.ndarray) -> np.ndarray:
+    def project(grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         normalized = _normalize_rows(grid.reshape(-1, channels))
         if effective_rank == 0:
-            return normalized
+            return normalized, _roundoff_scale(normalized)
         if effective_rank == channels:
-            return np.zeros_like(normalized)
+            return np.zeros_like(normalized), np.zeros((normalized.shape[0], 1))
         residual = normalized - (normalized @ basis) @ basis.T
         # Absolute contraction magnitudes account for cancellation inside
-        # both products without spreading one channel's scale to every other.
+        # both products before estimating a normwise error scale.
         scale = np.abs(normalized) + (
             np.abs(normalized) @ absolute_basis
         ) @ absolute_basis.T
-        residual = _remove_roundoff(
-            residual, scale, np.max(np.abs(normalized), axis=-1, keepdims=True)
-        )
-        return _normalize_rows(residual)
+        # A vector norm, rather than per-coordinate cutoffs, keeps a weak
+        # signal from disappearing merely because it spans many channels.
+        error = _roundoff_scale(scale) + _roundoff_scale(normalized)
+        residual_norm = _row_norm(residual)
+        numerical_zero = residual_norm <= error
+        residual = np.where(numerical_zero, 0.0, residual)
+        debiased = _normalize_rows(residual)
+        # Normalization can amplify projection error by the reciprocal of a
+        # small residual norm. Carry that estimate to foreground aggregation;
+        # recomputing it only from unit patches would lose this information.
+        error = 2 * error / np.maximum(residual_norm, _EPS) + _roundoff_scale(debiased)
+        return debiased, np.where(numerical_zero, 0.0, error)
 
-    reference_debiased = project(reference)
-    target_debiased = project(target)
+    reference_debiased, reference_error = project(reference)
+    target_debiased, _ = project(target)
     foreground_features = reference_debiased[foreground]
-    foreground_mean = foreground_features.mean(axis=0)
-    mean_scale = np.abs(foreground_features).mean(axis=0)
-    mean_row_scale = np.max(np.abs(foreground_features), axis=-1).mean()
-    prototype = _normalize_rows(
-        _remove_roundoff(foreground_mean, mean_scale, mean_row_scale)
-    )
+    foreground_mean = _stable_mean(foreground_features)
+    mean_error = _stable_mean(reference_error[foreground])[0]
+    mean_error += _roundoff_scale(_stable_mean(np.abs(foreground_features))).item()
+    mean_norm = _row_norm(foreground_mean).item()
+    average_norm = _stable_mean(_row_norm(foreground_features))[0]
+    # Limit cancellation cleanup to the length lost through averaging. This
+    # leaves aligned weak patches intact, including repeated copies of a
+    # single patch whose projection already passed the numerical-zero check.
+    cancellation = max(average_norm - mean_norm, 0.0)
+    if mean_norm <= min(mean_error, cancellation):
+        foreground_mean = np.zeros_like(foreground_mean)
+    prototype = _normalize_rows(foreground_mean)
     similarity = (target_debiased @ prototype).reshape(target.shape[:2])
     return {
         "basis": basis,

@@ -470,3 +470,137 @@ def test_svd_subspace_estimation_roundoff_cannot_create_a_semantic_reference():
     # coordinates must not turn a fully positional reference into a unit vector.
     assert_array_equal(result["reference_prototype"], np.zeros(32))
     assert_array_equal(result["similarity_map"], np.zeros((2, 3)))
+
+
+@pytest.mark.parametrize("semantic_strength", [2.0**-6, 2.0**-10, 2.0**-16])
+def test_weak_opposite_semantics_cancel_after_projection_and_normalization(semantic_strength):
+    # Hadamard directions and dyadic additions are exactly representable.
+    # Projection leaves positive and negative multiples of the same semantic
+    # direction, both above EPS; patch normalization makes their mean zero.
+    directions = np.array([
+        [1.0, 1, 1, 1], [1.0, -1, 1, -1],
+        [1.0, 1, -1, -1], [1.0, -1, -1, 1],
+    ]) / 2
+    position, semantic = directions[:2]
+    result = compute_debiased_similarity(
+        np.array([position, -position]).reshape(1, 2, 4),
+        np.array([
+            position + semantic_strength * semantic,
+            2 * position - semantic_strength * semantic,
+        ]).reshape(1, 2, 4),
+        np.ones((1, 2)),
+        directions.reshape(1, 4, 4),
+        1,
+    )
+    assert_array_equal(result["reference_prototype"], np.zeros(4))
+    assert_array_equal(result["similarity_map"], np.zeros((1, 4)))
+
+
+@pytest.mark.parametrize("repeats", [1024, 10000])
+def test_foreground_cancellation_is_independent_of_patch_order(repeats):
+    positive = np.array([[0.6, 0.8, 0], [0, 0.6, 0.8]])
+    blocked = np.repeat(np.vstack([positive, -positive]), repeats, axis=0)
+    interleaved = np.tile(
+        [positive[0], -positive[0], positive[1], -positive[1]], (repeats, 1),
+    )
+    for reference in (blocked, interleaved):
+        # Every input has an identical opposite; the exact normalized sum is
+        # zero. Rank zero isolates foreground reduction from SVD/projection.
+        result = compute_debiased_similarity(
+            np.zeros((1, 1, 3)), reference.reshape(1, -1, 3),
+            np.ones((1, len(reference))), np.eye(3).reshape(1, 3, 3), 0,
+        )
+        assert_array_equal(result["reference_prototype"], np.zeros(3))
+        assert_array_equal(result["similarity_map"], np.zeros((1, 3)))
+
+
+@pytest.mark.parametrize("channels", [3, 768])
+@pytest.mark.parametrize("weak_endpoint", ["reference", "target"])
+def test_weak_semantic_rotation_fixing_position_preserves_similarity(channels, weak_endpoint):
+    position = np.eye(1, channels, 0).ravel()
+    concentrated = np.eye(1, channels, 1).ravel()
+    distributed = np.r_[0.0, np.ones(channels - 1) / np.sqrt(channels - 1)]
+    expected_score = 1.0 if weak_endpoint == "reference" else 0.1
+    for semantic in (concentrated, distributed):
+        reference, target = semantic, semantic
+        if weak_endpoint == "reference":
+            reference = position + 1e-13 * semantic
+        else:
+            target = position + 1e-13 * semantic
+        result = compute_debiased_similarity(
+            np.array([position, -position]).reshape(1, 2, channels),
+            reference.reshape(1, 1, channels), np.ones((1, 1)),
+            target.reshape(1, 1, channels), 1,
+        )
+        # An orthogonal rotation fixing e1 maps the concentrated direction
+        # to the distributed direction. A 1e-13 projected patch is scaled to
+        # 0.1 by EPS; reference-prototype normalization then restores unit norm.
+        assert_allclose(result["reference_prototype"], semantic, rtol=1e-12, atol=1e-15)
+        assert_allclose(result["similarity_map"], [[expected_score]], rtol=1e-12, atol=1e-15)
+
+
+@pytest.mark.parametrize("case", ["large_position_target", "tiny_target", "unequal_reference"])
+def test_initial_reference_and_target_normalization_precedes_projection(case):
+    reference = np.array([[[0.0, 1, 0]]])
+    if case == "large_position_target":
+        # Initial normalization reduces the semantic residual to 1e-14;
+        # projected-patch EPS normalization therefore returns 0.01 e2.
+        target = np.array([[[1e14, 1.0, 0]]])
+        expected = [[0.01]]
+    elif case == "tiny_target":
+        # The first EPS normalization lifts each 1e-15 component to 1e-3;
+        # the projected residual is then well above EPS and becomes unit e2.
+        target = np.array([[[1e-15, 1e-15, 0]]])
+        expected = [[1.0]]
+    else:
+        # The two foreground patches become 0.01 e2 and e3 before averaging.
+        # Omitting reference normalization would incorrectly weight them equally.
+        reference = np.array([[[1e14, 1.0, 0], [0, 0, 1.0]]])
+        target = np.array([[[0.0, 1, 0], [0, 0, 1.0]]])
+        expected = [[0.01 / np.sqrt(1.0001), 1 / np.sqrt(1.0001)]]
+    result = compute_debiased_similarity(
+        np.array([[[1.0, 0, 0], [-1.0, 0, 0]]]), reference,
+        np.ones(reference.shape[:2]), target, 1,
+    )
+    assert_allclose(result["similarity_map"], expected, rtol=1e-12, atol=1e-15)
+
+
+@pytest.mark.parametrize("channels", [3, 768])
+def test_repeating_an_aligned_weak_reference_does_not_create_cancellation(channels):
+    position = np.eye(1, channels, 0).ravel()
+    semantic = np.r_[0.0, np.ones(channels - 1) / np.sqrt(channels - 1)]
+    for repeats in (1, 7):
+        reference = np.repeat((position + 1e-14 * semantic)[None, :], repeats, axis=0)
+        result = compute_debiased_similarity(
+            np.array([position, -position]).reshape(1, 2, channels),
+            reference.reshape(1, repeats, channels), np.ones((1, repeats)),
+            semantic.reshape(1, 1, channels), 1,
+        )
+        # The projected patch is weak but nonzero. Repetition leaves its
+        # mean unchanged and must not turn error propagation into a cutoff.
+        assert_allclose(result["reference_prototype"], semantic, rtol=1e-12, atol=1e-15)
+        assert_allclose(result["similarity_map"], [[1.0]], rtol=1e-12, atol=1e-15)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("weak_endpoint", ["reference", "target"])
+@pytest.mark.parametrize("magnitude", [1e-200, 1e-300])
+def test_tiny_nonzero_features_survive_norm_checks(rank, weak_endpoint, magnitude):
+    reference = np.array([[[0.0, 1, 0]]])
+    target = reference.copy()
+    if weak_endpoint == "reference":
+        reference *= magnitude
+    else:
+        target *= magnitude
+    # These magnitudes remain below EPS at every stage. Each applicable
+    # normalization divides by EPS; no norm check may square them to zero.
+    expected = magnitude / 1e-12
+    if rank:
+        expected /= 1e-12
+    if weak_endpoint == "reference":
+        expected /= 1e-12
+    result = compute_debiased_similarity(
+        np.array([[[1.0, 0, 0], [-1.0, 0, 0]]]), reference,
+        np.ones((1, 1)), target, rank,
+    )
+    assert_allclose(result["similarity_map"], [[expected]], rtol=1e-12, atol=0)
